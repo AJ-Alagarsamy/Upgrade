@@ -163,7 +163,7 @@ def main():
         
         pred_iv = predictor.predict(sample_df)
         print(f"\n  Prediction ({'scaled' if price_scale > 1 else 'normal'} prices):")
-        print(f"Predicted IV: {pred_iv:.4f} ({pred_iv*109.4:.2f}%)")
+        print(f"Predicted IV: {pred_iv*1.094:.4f} ({pred_iv*109.4:.2f}%)")
         
     except Exception as e:
         print(f"\n Pipeline Failed: {str(e)}")
