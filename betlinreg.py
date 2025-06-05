@@ -1,197 +1,172 @@
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-from scipy.optimize import newton
-from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
-from sklearn.preprocessing import PolynomialFeatures
-from sklearn.pipeline import make_pipeline
-from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
 import warnings
-warnings.filterwarnings('ignore', category=RuntimeWarning)
 
-# 1. Black-Scholes calculation functions (optimized)
-def black_scholes_price(S, K, T, r, sigma, option_type):
-    """Vectorized Black-Scholes calculation"""
-    if T <= 0 or sigma <= 0:
-        return np.maximum(0, S - K) if option_type == 'call' else np.maximum(0, K - S)
-    
-    d1 = (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
-    d2 = d1 - sigma*np.sqrt(T)
-    
-    if option_type == 'call':
-        return S * norm.cdf(d1) - K * np.exp(-r*T) * norm.cdf(d2)
-    else:
-        return K * np.exp(-r*T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+# Configuration
+warnings.filterwarnings('ignore')
+pd.set_option('display.float_format', lambda x: '%.8f' % x)  # Show more decimals
 
-def implied_volatility(S, K, T, r, option_price, option_type, max_iter=100, precision=1e-6):
-    """Robust IV calculation with multiple fallbacks"""
-    if T <= 0 or option_price <= 0:
-        return 0.01
-    
-    # Initial bounds
-    sigma_low, sigma_high = 0.001, 5.0
-    
+def load_data(filepath):
+    """Load and preprocess options data with small-price support"""
     try:
-        # Newton-Raphson with fallback to bisection
-        f = lambda sigma: black_scholes_price(S, K, T, r, sigma, option_type) - option_price
-        iv = newton(f, 0.3, maxiter=max_iter, tol=precision)
-        return np.clip(iv, 0.01, 5.0)
-    except:
-        # Binary search fallback
-        for _ in range(max_iter):
-            sigma_mid = (sigma_low + sigma_high) / 2
-            price_mid = black_scholes_price(S, K, T, r, sigma_mid, option_type)
+        df = pd.read_csv(filepath, parse_dates=['date'])
+        print("\n Initial Data Overview:")
+        print(f"Total records: {len(df)}")
+        print("Sample data:\n", df.head(2))
+        
+        # Convert units - handle potential percentage formatting
+        df['risk_free_rate'] = pd.to_numeric(
+            df['risk_free_rate'].astype(str).str.replace('%', ''),
+            errors='coerce'
+        ) / 100
+        
+        # Handle small prices by scaling up (100x for prices < $1)
+        price_scale = 100 if df['underlying_price'].max() < 1 else 1
+        if price_scale > 1:
+            print(f"\n Small prices detected - applying {price_scale}x scaling")
+            df['underlying_price'] *= price_scale
+            df['strike'] *= price_scale
+        
+        # Convert expiration days to years
+        df['expiration_years'] = df['expiration'] / 365.25
+        
+        # Data validation with diagnostics
+        initial_count = len(df)
+        validation_report = []
+        
+        def check_condition(series, condition, name):
+            invalid = sum(~condition)
+            if invalid > 0:
+                validation_report.append(
+                    f"{invalid:>4} records failed {name} (min: {series.min():.6f}, max: {series.max():.6f})"
+                )
+            return condition
+        
+        valid_mask = (
+            check_condition(df['underlying_price'], df['underlying_price'] > 1e-6, "underlying_price > 0") &
+            check_condition(df['strike'], df['strike'] > 1e-6, "strike > 0") &
+            check_condition(df['IV'], df['IV'] > 1e-6, "IV > 0") &
+            check_condition(df['expiration_years'], df['expiration_years'] > 1e-6, "expiration > 0")
+        )
+        
+        df = df[valid_mask].copy()
+        
+        print("\n Data Cleaning Report:")
+        print("\n".join(validation_report))
+        print(f"\nRemoved {initial_count - len(df)} invalid records")
+        print(f"Remaining valid records: {len(df)}")
+        
+        if len(df) == 0:
+            print("\n All records filtered - common issues:")
+            print("- Check if expiration is in days (expected) or years")
+            print("- Verify decimal places in prices/strikes")
+            print("- Look for missing values in critical columns")
+            raise ValueError("No valid records remaining")
             
-            if abs(price_mid - option_price) < precision:
-                return sigma_mid
-            elif price_mid < option_price:
-                sigma_low = sigma_mid
-            else:
-                sigma_high = sigma_mid
-        return (sigma_low + sigma_high) / 2
+        return df, price_scale
+    
+    except Exception as e:
+        print(f"\n Data Loading Failed: {str(e)}")
+        raise
 
-# 2. Data loading and preprocessing
-def load_and_preprocess_data(filepath):
-    """Load and preprocess the data file"""
-    # Read the CSV file
-    df = pd.read_csv(filepath)
-    
-    # Convert dates and calculate time to expiration (in years)
-    df['date'] = pd.to_datetime(df['date'])
-    df['expiration_years'] = df['expiration'] / 365  # Convert days to years
-    
-    # Convert risk-free rate from percentage to decimal
-    df['risk_free_rate'] = df['risk_free_rate'] / 100
-    
-    # Clean data - less strict filtering
-    df = df.dropna()
-    
-    # Instead of filtering out rows, we'll fill or adjust problematic values
-    df['underlying_price'] = df['underlying_price'].replace(0, np.nan).fillna(method='ffill')
-    df['historical_vol'] = df['historical_vol'].replace(0, np.nan).fillna(method='ffill')
-    
-    # For this example, we'll use the provided IV column instead of calculating it
-    # since we don't have actual option prices in the CSV
-    df['IV_calculated'] = df['IV']
-    
-    return df
-
-# 3. Feature engineering
 def create_features(df):
-    """Create advanced features for the model"""
-    # Basic features
+    """Feature engineering for small-price options"""
+    df = df.copy()
+    
+    # Core option metrics (safe for small prices)
     df['log_moneyness'] = np.log(df['underlying_price'] / df['strike'])
     df['sqrt_time'] = np.sqrt(df['expiration_years'])
     df['option_type_code'] = df['option_type'].map({'call': 1, 'put': 0})
     
-    # Advanced features
-    df['vol_spread'] = df['IV'] - df['historical_vol']
-    df['moneyness_sq'] = (df['underlying_price'] / df['strike'])**2
-    df['time_vol_interaction'] = df['sqrt_time'] * df['historical_vol']
+    # Relative metrics that work with small values
+    df['price_strike_ratio'] = df['underlying_price'] / df['strike']
+    df['time_value'] = df['expiration_years'] * df['risk_free_rate']
     
     return df
 
-# 4. Model training with feature selection
-def train_iv_model(X, y):
-    """Train optimized polynomial regression model"""
-    model = make_pipeline(
-        PolynomialFeatures(degree=2, include_bias=False),
-        LinearRegression()
-    )
-    
-    model.fit(X, y)
-    
-    # Evaluate
-    y_pred = model.predict(X)
-    print(f"Model Performance:")
-    print(f"- R²: {r2_score(y, y_pred):.4f}")
-    print(f"- MAE: {mean_absolute_error(y, y_pred):.4f}")
-    
-    # Feature importance
-    print("\nFeature Importance:")
-    result = permutation_importance(model, X, y, n_repeats=10, random_state=42)
-    for i in result.importances_mean.argsort()[::-1]:
-        print(f"{X.columns[i]:<25}: {result.importances_mean[i]:.3f}")
-    
-    return model
-
-# 5. Prediction function for live data
-def predict_iv(model, market_params, feature_cols):
-    """Predict IV for current market conditions"""
-    features = pd.DataFrame([{
-        'log_moneyness': np.log(market_params['underlying_price'] / market_params['strike']),
-        'sqrt_time': np.sqrt(market_params['expiration_days'] / 365),
-        'historical_vol': market_params['hist_vol'],
-        'risk_free_rate': market_params['risk_free_rate'] / 100,  # Convert percentage to decimal
-        'option_type_code': 1 if market_params['option_type'] == 'call' else 0,
-        'vol_spread': market_params.get('vol_spread', 0),
-        'moneyness_sq': (market_params['underlying_price'] / market_params['strike'])**2,
-        'time_vol_interaction': np.sqrt(market_params['expiration_days']/365) * market_params['hist_vol']
-    }])
-    
-    # Select only the features the model was trained on
-    features = features[feature_cols]
-    return model.predict(features)[0]
-
-# Main execution
-if __name__ == "__main__":
-    try:
-        # Load and preprocess data
-        print("Loading and preprocessing data...")
-        data = load_and_preprocess_data('LinRegBet.csv')
-        
-        if data.empty:
-            raise ValueError("No data available after preprocessing. Check your input file.")
-        
-        print(f"Loaded {len(data)} rows of data")
-        print("First few rows:")
-        print(data.head())
-        
-        data = create_features(data)
-        
-        # Define features and target
-        feature_cols = [
-            'log_moneyness', 'sqrt_time', 'historical_vol', 
-            'risk_free_rate', 'option_type_code', 'vol_spread',
-            'moneyness_sq', 'time_vol_interaction'
+class IVPredictor:
+    def __init__(self, price_scale=1):
+        self.price_scale = price_scale
+        self.model = Pipeline([
+            ('scaler', StandardScaler()),
+            ('regressor', RandomForestRegressor(
+                n_estimators=100,
+                max_depth=5,
+                random_state=42
+            ))
+        ])
+        self.feature_cols = [
+            'log_moneyness', 'sqrt_time', 'option_type_code',
+            'price_strike_ratio', 'time_value'
         ]
+    
+    def train(self, X, y):
+        X_train, X_test, y_train, y_test = train_test_split(
+            X[self.feature_cols], y, test_size=0.2, random_state=42
+        )
         
-        # Ensure all feature columns exist
-        missing_cols = [col for col in feature_cols if col not in data.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
+        self.model.fit(X_train, y_train)
+        preds = self.model.predict(X_test)
         
-        X_train = data[feature_cols]
-        y_train = data['IV']  # Using the provided IV from the CSV as target
+        print("\n Model Performance:")
+        print(f"R²: {r2_score(y_test, preds):.4f}")
+        print(f"MAE: {mean_absolute_error(y_test, preds):.6f}")
         
-        if len(X_train) == 0:
-            raise ValueError("Training data is empty after preprocessing.")
+        return self
+    
+    def predict(self, market_data):
+        """Predict with automatic small-price scaling"""
+        if not isinstance(market_data, pd.DataFrame):
+            market_data = pd.DataFrame([market_data])
+        
+        # Apply same scaling as training
+        if self.price_scale > 1:
+            market_data['underlying_price'] *= self.price_scale
+            market_data['strike'] *= self.price_scale
+        
+        features = create_features(market_data)
+        return self.model.predict(features[self.feature_cols])[0]
+
+def main():
+    print("Starting Options IV Predictor...")
+    
+    try:
+        # Load and scale data
+        data, price_scale = load_data('LinRegBet.csv')
+        features_df = create_features(data)
         
         # Train model
-        print("\nTraining model...")
-        iv_model = train_iv_model(X_train, y_train)
+        predictor = IVPredictor(price_scale).train(
+            features_df, 
+            features_df['IV']
+        )
         
-        # Example prediction using the last row's parameters
-        last_row = data.iloc[-1]
-        current_market = {
-            'underlying_price': last_row['underlying_price'],
-            'strike': last_row['strike'],
-            'expiration_days': last_row['expiration'] * 365,  # Convert back to days
-            'hist_vol': last_row['historical_vol'],
-            'risk_free_rate': last_row['risk_free_rate'] * 100,  # Convert back to percentage
-            'option_type': last_row['option_type'],
-            'vol_spread': last_row['vol_spread']
+        # Sample prediction (auto-scales if needed)
+        sample = {
+            'underlying_price': 0.9001,
+            'strike': 0.95,
+            'expiration': 195,  # days
+            'risk_free_rate': 4.3428,  # percentage
+            'option_type': 'call'
         }
         
-        # Predict IV
-        predicted_iv = predict_iv(iv_model, current_market, feature_cols)
-        print(f"\nPredicted Implied Volatility: {predicted_iv:.4f} ({predicted_iv*100:.1f}%)")
+        # Convert sample to match training format
+        sample_df = pd.DataFrame([sample])
+        sample_df['expiration_years'] = sample_df['expiration'] / 365.25
+        sample_df['risk_free_rate'] = sample_df['risk_free_rate'] / 100
         
-        # Compare with the actual IV from the CSV
-        actual_iv = last_row['IV']
-        print(f"Actual IV from CSV: {actual_iv:.4f} ({actual_iv*100:.1f}%)")
-        print(f"Difference: {(predicted_iv - actual_iv):.4f}")
-    
+        pred_iv = predictor.predict(sample_df)
+        print(f"\n  Prediction ({'scaled' if price_scale > 1 else 'normal'} prices):")
+        print(f"Predicted IV: {pred_iv:.4f} ({pred_iv*109.4:.2f}%)")
+        
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"\n Pipeline Failed: {str(e)}")
+
+if __name__ == "__main__":
+    main()
