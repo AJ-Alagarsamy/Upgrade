@@ -149,10 +149,10 @@ def main():
         
         # Sample prediction (auto-scales if needed)
         sample = {
-            'underlying_price': 0.9001,
+            'underlying_price': 0.90,
             'strike': 0.95,
-            'expiration': 195,  # days
-            'risk_free_rate': 4.3428,  # percentage
+            'expiration': 194,  # days
+            'risk_free_rate': 4.351,  # percentage
             'option_type': 'call'
         }
         
