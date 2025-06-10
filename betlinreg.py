@@ -149,16 +149,16 @@ def main():
         
         # Sample prediction (auto-scales if needed)
         sample = {
-            'underlying_price': 0.90,
+            'underlying_price': 0.955,
             'strike': 0.95,
-            'expiration': 194,  # days
-            'risk_free_rate': 4.351,  # percentage
+            'expiration': 190,  # days
+            'risk_free_rate': 4.311,  # percentage
             'option_type': 'call'
         }
         
         # Convert sample to match training format
         sample_df = pd.DataFrame([sample])
-        sample_df['expiration_years'] = sample_df['expiration'] / 365.25
+        sample_df['expiration_years'] = sample_df['expiration'] / 365
         sample_df['risk_free_rate'] = sample_df['risk_free_rate'] / 100
         
         pred_iv = predictor.predict(sample_df)
